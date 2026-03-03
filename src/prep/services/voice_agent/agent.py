@@ -8,7 +8,7 @@ import os
 from google.adk.agents import Agent
 
 from src.prep.config import settings
-from src.prep.services.prompts import get_prompt_manager
+from src.prep.services.prompts import load_prompt
 from src.prep.services.voice_agent.tools import end_interview
 
 logger = logging.getLogger(__name__)
@@ -31,33 +31,16 @@ def create_interview_agent(drill_context: dict) -> Agent:
     Create an interview coaching agent with drill-specific context.
 
     Args:
-        drill_context: Dict containing drill_title, drill_description,
+        drill_context: Dict containing title, problem_statement, context,
                        problem_type, skills_tested, user_name, discipline
     """
     _ensure_genai_env()
 
-    prompt_manager = get_prompt_manager()
-
-    # skills_tested = drill_context.get("skills_tested") or []
-    # skills_formatted = "\n".join(f"- {skill}" for skill in skills_tested) or "None"
-    discipline = drill_context.get("discipline", "product")
-
-    if discipline == "product":
-        prompt_name = "voice-agent-product"
-    elif discipline == "design":
-        prompt_name = "voice-agent-design"
-    elif discipline == "marketing":
-        prompt_name = "voice-agent-marketing"
-    else:
-        raise ValueError(f"Invalid discipline: {discipline}")
-
-    instruction = prompt_manager.format_prompt(
-        prompt_name=prompt_name,
-        variables={
-            "title": drill_context.get("title", ""),
-            "problem_statement": drill_context.get("problem_statement", ""),
-            "context": drill_context.get("context", ""),
-        },
+    raw = load_prompt("voice_agent")
+    instruction = raw.format(
+        title=drill_context.get("title", ""),
+        problem_statement=drill_context.get("problem_statement", ""),
+        context=drill_context.get("context", ""),
     )
 
     model = os.getenv("GEMINI_LIVE_MODEL", settings.gemini_live_model)

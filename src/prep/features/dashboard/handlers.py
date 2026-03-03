@@ -1,7 +1,5 @@
 """API handlers for dashboard screen."""
 
-import logging
-from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 

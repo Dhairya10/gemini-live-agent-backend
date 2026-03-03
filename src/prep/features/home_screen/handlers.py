@@ -280,9 +280,7 @@ def _find_eligible_drills(user_id: str, discipline: str, target_skill: dict) -> 
 
 async def _llm_select_drill(drills: list[dict], target_skill: dict, user_id: str) -> dict:
     """
-    Use LLM to select best drill from multiple options.
-
-    Uses drill_recommendation.md prompt template with gemini-2.0-flash-exp.
+    Use ADK LlmAgent to select the best drill from multiple options.
 
     Args:
         drills: List of eligible drills
@@ -292,47 +290,42 @@ async def _llm_select_drill(drills: list[dict], target_skill: dict, user_id: str
     Returns:
         Selected drill with recommendation_reasoning field added
     """
-    from src.prep.config import settings
+    from src.prep.features.home_screen.agents import recommendation_agent
+    from src.prep.services.adk_runner import run_agent_once_with_retry
     from src.prep.services.database import get_query_builder
-    from src.prep.services.llm import get_llm_provider
-    from src.prep.services.prompts import get_prompt_manager
+    from src.prep.services.llm.schemas import DrillRecommendation
+
+    # Determine targeting reason based on skill zone
+    zone = target_skill.get("zone")
+    if zone == "red":
+        targeting_reason = f"This skill ({target_skill['name']}) needs immediate attention"
+    elif zone == "yellow":
+        targeting_reason = (
+            f"This skill ({target_skill['name']}) is developing and needs practice"
+        )
+    elif not target_skill.get("is_tested"):
+        targeting_reason = f"This skill ({target_skill['name']}) hasn't been tested yet."
+    else:
+        targeting_reason = f"This skill ({target_skill['name']}) could use reinforcement."
 
     try:
-        # Get user summary for context
         db = get_query_builder()
         profile = db.list_records("user_profile", filters={"user_id": user_id}, limit=1)
         user_summary = profile[0].get("user_summary") if profile else None
 
-        # Determine targeting reason based on skill zone
-        zone = target_skill.get("zone")
-        if zone == "red":
-            targeting_reason = (
-                f"This skill ({target_skill['name']}) needs immediate attention"
-            )
-        elif zone == "yellow":
-            targeting_reason = f"This skill ({target_skill['name']}) is developing and needs practice"
-        elif not target_skill.get("is_tested"):
-            targeting_reason = f"This skill ({target_skill['name']}) hasn't been tested yet."
-        else:
-            targeting_reason = f"This skill ({target_skill['name']}) could use reinforcement."
-
-        # Format eligible drills for prompt
         drills_text = "\n\n".join(
-            [
-                f"**Drill {i + 1}**\n"
-                f"- ID: {d['id']}\n"
-                f"- Title: {d.get('title', 'Unknown')}\n"
-                f"- Prompt: {d.get('problem_statement') or d.get('context') or 'No prompt provided'}\n"
-                f"- Problem Type: {d.get('problem_type', 'N/A')}"
-                for i, d in enumerate(drills)
-            ]
+            f"**Drill {i + 1}**\n"
+            f"- ID: {d['id']}\n"
+            f"- Title: {d.get('title', 'Unknown')}\n"
+            f"- Prompt: {d.get('problem_statement') or d.get('context') or 'No prompt provided'}\n"
+            f"- Problem Type: {d.get('problem_type', 'N/A')}"
+            for i, d in enumerate(drills)
         )
 
-        # Load and format prompt from Opik
-        prompt_mgr = get_prompt_manager()
-        prompt = prompt_mgr.format_prompt(
-            prompt_name="drill-recommendation",
-            variables={
+        state = await run_agent_once_with_retry(
+            recommendation_agent,
+            user_id=user_id,
+            session_state={
                 "user_summary": user_summary or "No user summary available",
                 "skill_name": target_skill["name"],
                 "skill_description": target_skill.get("description", ""),
@@ -341,63 +334,20 @@ async def _llm_select_drill(drills: list[dict], target_skill: dict, user_id: str
             },
         )
 
-        # Initialize LLM provider
-        from src.prep.services.llm import DrillRecommendation
+        raw = state.get("drill_recommendation", "")
+        if isinstance(raw, dict):
+            result = DrillRecommendation.model_validate(raw)
+        else:
+            result = DrillRecommendation.model_validate_json(raw)
 
-        llm = get_llm_provider(
-            provider_name="gemini",
-            model=settings.llm_drill_selection_model,
-            system_prompt="You are an AI interview coach selecting practice drills.",
-            response_format=DrillRecommendation.model_json_schema(),
-            enable_thinking=False,
-            temperature=0.7,
-            max_tokens=2048,
+        selected_drill = next(
+            (d for d in drills if str(d["id"]) == str(result.drill_id)), drills[0]
         )
-
-        # Generate selection
-        response = await llm.generate(prompt)
-
-        # Log for debugging - defensive against malformed response
-        try:
-            response_content = response.content if response.content else ""
-            logger.info(
-                "LLM drill selection response preview (length=%d): %s",
-                len(response_content),
-                response_content[:500],
-            )
-        except Exception as log_error:
-            logger.warning("Failed to log drill selection response: %s", log_error)
-
-        # Check for empty response before parsing
-        if not response.content or not response.content.strip():
-            raise ValueError("LLM returned empty response for drill selection")
-
-        # Parse JSON from response (handle code blocks)
-        import json
-        import re
-
-        content = response.content.strip()
-        json_match = re.search(r"```(?:json)?\s*({.*?})\s*```", content, re.DOTALL)
-        if json_match:
-            content = json_match.group(1)
-
-        # Validate content before parsing
-        if not content:
-            raise ValueError("No JSON content found in LLM response for drill selection")
-
-        selection = json.loads(content)
-        selected_id = selection["drill_id"]
-        reasoning = selection["reasoning"]
-
-        # Find the selected drill
-        selected_drill = next((d for d in drills if str(d["id"]) == str(selected_id)), drills[0])
-        selected_drill["recommendation_reasoning"] = reasoning
-
+        selected_drill["recommendation_reasoning"] = result.reasoning
         return selected_drill
 
     except Exception as e:
-        logger.error(f"LLM drill selection failed: {e}", exc_info=True)
-        # Fallback: use first drill with generic reasoning
+        logger.error("LLM drill selection failed: %s", e, exc_info=True)
         selected = drills[0]
         selected["recommendation_reasoning"] = (
             f"This drill focuses on {target_skill['name']}. {targeting_reason}"

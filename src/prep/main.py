@@ -3,16 +3,14 @@
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from src.prep.config import settings
-from src.prep.services.rate_limiter import limiter
 from src.prep.features.dashboard import router as dashboard_router
 from src.prep.features.drill_sessions import router as drill_sessions_router
 from src.prep.features.home_screen import router as home_router
@@ -21,6 +19,7 @@ from src.prep.features.onboarding import router as onboarding_router
 from src.prep.features.profile import router as profile_router
 from src.prep.features.skills import router as skills_router
 from src.prep.services.auth import JWKSCache, JWTValidator, set_jwt_validator
+from src.prep.services.rate_limiter import limiter
 from src.prep.services.voice_agent import router as voice_router
 
 logger = logging.getLogger(__name__)

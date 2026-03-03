@@ -1,7 +1,6 @@
 """Rate limiting service for API endpoints."""
 
 import logging
-from typing import Callable
 
 from fastapi import Request
 from slowapi import Limiter

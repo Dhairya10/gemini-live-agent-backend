@@ -1,118 +1,170 @@
-"""Tests for feedback parsing and structured-output fallback behavior."""
+"""Tests for feedback service schema validation."""
 
-from unittest.mock import AsyncMock, patch
+import json
+from unittest.mock import patch
 
 import pytest
 
 from src.prep.features.feedback.schemas import DrillFeedback
-from src.prep.features.feedback.service import FeedbackService
-from src.prep.services.llm.base import LLMResponse
 
 
-def test_parse_json_response_dict_handles_fenced_json() -> None:
-    raw = """```json
-    {"summary":"Good session","skills":[{"skill_name":"Communication","evaluation":"Partially","feedback":"Clear narrative."}]}
-    ```"""
-
-    parsed = FeedbackService._parse_json_response_dict(raw)
-
-    assert parsed["summary"] == "Good session"
-    assert parsed["skills"][0]["evaluation"] == "Partially"
-
-
-def test_normalize_feedback_payload_maps_known_aliases() -> None:
+def test_drill_feedback_valid_schema() -> None:
+    """DrillFeedback schema validates correct JSON from ADK agent output."""
     payload = {
-        "summary": "Summary",
+        "summary": "You structured your answer well and showed clear prioritization skills.",
         "skills": [
-            {"skill_name": "Communication", "evaluation": "Partially", "feedback": "Text"},
-            {"skill_name": "Prioritization", "evaluation": "Did not demonstrate", "feedback": "Text"},
+            {
+                "skill_name": "Frameworking",
+                "evaluation": "Demonstrated",
+                "feedback": "You used a clear structure and outlined tradeoffs effectively.",
+            },
+            {
+                "skill_name": "Metrics",
+                "evaluation": "Partial",
+                "feedback": "Mentioned KPIs but lacked concrete success metrics.",
+                "improvement_suggestion": "Add specific metrics and explain how you'd measure impact.",
+            },
         ],
     }
+    feedback = DrillFeedback.model_validate(payload)
+    assert feedback.summary.startswith("You structured")
+    assert len(feedback.skills) == 2
+    assert feedback.skills[0].evaluation.value == "Demonstrated"
+    assert feedback.skills[1].evaluation.value == "Partial"
 
-    normalized = FeedbackService._normalize_feedback_payload(payload)
 
-    assert normalized["skills"][0]["evaluation"] == "Partial"
-    assert normalized["skills"][1]["evaluation"] == "Missed"
-
-
-@pytest.mark.asyncio
-async def test_generate_drill_feedback_retries_on_invalid_primary_json() -> None:
-    service = FeedbackService()
-    service._format_prompt_template = lambda *args, **kwargs: "prompt"
-
-    primary_provider = AsyncMock()
-    primary_provider.generate = AsyncMock(
-        return_value=LLMResponse(
-            content='{"summary"',
-            usage={},
-            metadata={"model": "gemini-3-pro-preview"},
-        )
-    )
-
-    fallback_provider = AsyncMock()
-    fallback_provider.generate = AsyncMock(
-        return_value=LLMResponse(
-            content=(
-                '{"summary":"Good session","skills":[{"skill_name":"Communication",'
-                '"evaluation":"Partial","feedback":"Clear response."}]}'
-            ),
-            usage={},
-            metadata={"model": "gemini-3-flash-preview"},
-        )
-    )
-
-    with patch("src.prep.services.llm.get_llm_provider", side_effect=[primary_provider, fallback_provider]):
-        feedback, metadata = await service._generate_drill_feedback(
-            drill={"title": "Mock Drill", "description": "desc"},
-            skills=[{"name": "Communication", "description": "desc"}],
-            transcript="Candidate response",
-            context={},
-        )
-
-    assert feedback["skills"][0]["evaluation"] == "Partial"
-    assert metadata["model"] == "gemini-3-flash-preview"
-    assert primary_provider.generate.await_count == 1
-    assert fallback_provider.generate.await_count == 1
+def test_drill_feedback_model_validate_json() -> None:
+    """ADK output_key returns JSON string; model_validate_json parses it correctly."""
+    payload = {
+        "summary": "Strong structure with mixed clarity.",
+        "skills": [
+            {
+                "skill_name": "Communication",
+                "evaluation": "Partial",
+                "feedback": "Needs tighter framing.",
+            }
+        ],
+    }
+    json_str = json.dumps(payload)
+    feedback = DrillFeedback.model_validate_json(json_str)
+    assert feedback.skills[0].skill_name == "Communication"
 
 
 @pytest.mark.asyncio
-async def test_extract_user_summary_accepts_guarded_plain_text() -> None:
-    service = FeedbackService()
-    service._format_prompt_template = lambda *args, **kwargs: "prompt"
+async def test_run_feedback_agents_calls_run_agent_once_twice() -> None:
+    """_run_feedback_agents makes two sequential run_agent_once_with_retry calls."""
+    from src.prep.features.feedback.schemas import SkillPerformance
+    from src.prep.features.feedback.service import FeedbackService
 
-    provider = AsyncMock()
-    provider.generate = AsyncMock(
-        return_value=LLMResponse(
-            content=(
-                "Shows strong structure and product sense, but communication clarity still varies. "
-                "Should keep practicing concise stakeholder framing."
-            ),
-            usage={},
-            metadata={"model": "gemini-3-pro-preview"},
-        )
-    )
-
-    current_feedback = DrillFeedback.model_validate(
+    feedback_json = json.dumps(
         {
-            "summary": "Strong structure with mixed clarity.",
+            "summary": "Good session.",
             "skills": [
                 {
                     "skill_name": "Communication",
                     "evaluation": "Partial",
-                    "feedback": "Needs tighter framing.",
+                    "feedback": "Clear narrative but imprecise.",
+                }
+            ],
+        }
+    )
+    summary_json = json.dumps(
+        {
+            "summary": "User shows developing communication skills with 3 sessions completed.",
+            "new_insights": ["Needs more structured openings."],
+        }
+    )
+
+    call_count = 0
+
+    async def fake_runner(agent, *, user_id, session_state, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return {"drill_feedback": feedback_json}
+        return {"user_summary": summary_json}
+
+    service = FeedbackService()
+
+    with (
+        patch(
+            "src.prep.features.feedback.service.run_agent_once_with_retry",
+            side_effect=fake_runner,
+        ),
+        patch(
+            "src.prep.features.feedback.service.get_query_builder"
+        ) as mock_db,
+    ):
+        mock_db.return_value.list_records.return_value = [{"user_summary": None}]
+        mock_db.return_value.count_records.return_value = 3
+
+        feedback, updated_summary = await service._run_feedback_agents(
+            user_id="user-1",
+            drill={"title": "Mock Drill", "description": "A test drill"},
+            skills=[{"name": "Communication", "description": "Clear communication"}],
+            transcript="Candidate response transcript",
+            context={},
+        )
+
+    assert call_count == 2
+    assert feedback.summary == "Good session."
+    assert feedback.skills[0].evaluation == SkillPerformance.PARTIAL
+    assert "developing communication" in updated_summary
+
+
+@pytest.mark.asyncio
+async def test_run_feedback_agents_summary_failure_is_non_blocking() -> None:
+    """If UserSummaryAgent fails, _run_feedback_agents returns existing summary instead."""
+    import json
+
+    from src.prep.features.feedback.service import FeedbackService
+
+    feedback_json = json.dumps(
+        {
+            "summary": "Mixed session.",
+            "skills": [
+                {
+                    "skill_name": "Metrics",
+                    "evaluation": "Missed",
+                    "feedback": "No metrics mentioned.",
                 }
             ],
         }
     )
 
-    with patch("src.prep.services.llm.get_llm_provider", return_value=provider):
-        summary, metadata = await service._extract_user_summary(
+    call_count = 0
+
+    async def fake_runner(agent, *, user_id, session_state, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return {"drill_feedback": feedback_json}
+        raise RuntimeError("Summary agent blew up")
+
+    service = FeedbackService()
+
+    with (
+        patch(
+            "src.prep.features.feedback.service.run_agent_once_with_retry",
+            side_effect=fake_runner,
+        ),
+        patch(
+            "src.prep.features.feedback.service.get_query_builder"
+        ) as mock_db,
+    ):
+        mock_db.return_value.list_records.return_value = [
+            {"user_summary": "Existing summary text."}
+        ]
+        mock_db.return_value.count_records.return_value = 5
+
+        feedback, updated_summary = await service._run_feedback_agents(
             user_id="user-1",
-            current_summary=None,
-            current_feedback=current_feedback,
-            total_sessions=3,
+            drill={"title": "Mock Drill", "description": ""},
+            skills=[{"name": "Metrics", "description": "Using data"}],
+            transcript="No metrics mentioned.",
+            context={},
         )
 
-    assert "strong structure" in summary.lower()
-    assert metadata is not None
-    assert metadata["model"] == "gemini-3-pro-preview"
+    assert feedback.skills[0].skill_name == "Metrics"
+    # Falls back to existing summary, not empty string
+    assert updated_summary == "Existing summary text."

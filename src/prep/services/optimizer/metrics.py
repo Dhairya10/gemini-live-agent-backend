@@ -10,8 +10,8 @@ from typing import Any
 from google import genai
 from opik.evaluation.metrics import base_metric, score_result
 from opik.integrations.genai import track_genai
-
 from src.prep.services.llm.api_keys import resolve_google_api_key
+
 from src.prep.services.optimizer.template_utils import (
     format_transcript,
     parse_json_response,

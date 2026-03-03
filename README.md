@@ -1,4 +1,4 @@
-# Primed - Backend
+# Live Agent - Backend
 
 FastAPI-based backend for the Primed app.
 

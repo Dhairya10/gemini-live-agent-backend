@@ -41,12 +41,7 @@ class Settings(BaseSettings):
     voice_session_max_concurrent: int = 50
     min_feedback_duration_seconds: int = 120  # 2 minutes - sessions shorter than this skip feedback
 
-    # Opik Configuration
-    opik_api_key: str = ""
-    opik_workspace: str = "primed-hackathon"
-    opik_project_name: str = "primed-skill-eval"
-    opik_enabled: bool = False
-    opik_use_prompts: bool = False  # Use Opik Prompt Library (requires prompts in dashboard)
+
 
     # Model Configuration
     llm_feedback_model: str = "gemini-3-pro-preview"

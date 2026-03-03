@@ -1,10 +1,9 @@
 """Tests for onboarding API handlers."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
-from fastapi.testclient import TestClient
 
 from src.prep.services.auth.dependencies import get_current_user
 from src.prep.services.auth.models import JWTUser

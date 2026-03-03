@@ -2,7 +2,7 @@
 
 import logging
 
-from fastapi import APIRouter, Depends, Request, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from src.prep.features.profile.models import ProfileScreenResponse
 from src.prep.services.auth.dependencies import get_current_user

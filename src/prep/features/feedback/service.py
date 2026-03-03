@@ -1,18 +1,14 @@
 """Drill feedback evaluation service."""
 
-import json
 import logging
-import re
 from datetime import UTC, datetime
-
-from pydantic import ValidationError
 
 from src.prep.config import settings
 from src.prep.features.feedback.exceptions import FeedbackEvaluationError
 from src.prep.features.feedback.schemas import DrillFeedback, SkillPerformance
 from src.prep.features.home_screen.handlers import invalidate_recommendation_cache
+from src.prep.services.adk_runner import run_agent_once_with_retry
 from src.prep.services.database.utils import get_query_builder
-from src.prep.services.prompts import opik_track
 
 logger = logging.getLogger(__name__)
 
@@ -22,94 +18,151 @@ class FeedbackService:
     Service for evaluating drill session performance using LLM.
 
     Two-phase evaluation:
-    - Phase 1: LLM calls (no database locks)
+    - Phase 1: LLM calls via ADK agents (no database locks)
     - Phase 2: Atomic database updates
     """
 
-    def __init__(self) -> None:
-        """Initialize feedback service."""
-        self._prompt_manager = None
-        if settings.opik_enabled and settings.opik_use_prompts:
-            from src.prep.services.prompts import get_prompt_manager
-
-            try:
-                self._prompt_manager = get_prompt_manager()
-                logger.info("FeedbackService initialized with Opik Prompt Library")
-            except Exception as e:
-                logger.warning(f"Failed to initialize PromptManager: {e}. Using local prompts.")
-                self._prompt_manager = None
-
-    def _format_prompt_template(
-        self, prompt_name: str, variables: dict[str, str], local_file_path: str | None = None
-    ) -> str:
+    def _build_feedback_context(self, user_id: str, total_sessions: int, db) -> dict:
         """
-        Format prompt template from Opik or local file.
+        Build context for feedback generation.
+
+        If <=10 sessions: Use past evaluations
+        If >10 sessions: Use user_summary + last feedback
 
         Args:
-            prompt_name: Name of prompt in Opik (e.g., 'skill-feedback-evaluation')
-            variables: Dictionary of variables to format the prompt with
-            local_file_path: Path to local prompt file (fallback if Opik disabled)
+            user_id: User ID
+            total_sessions: Total completed sessions
+            db: Database query builder
 
         Returns:
-            Formatted prompt string
-
-        Raises:
-            FileNotFoundError: If local file not found when Opik disabled
+            Context dictionary with past_evaluations or user_summary
         """
-        # Try Opik Prompt Library first
-        if self._prompt_manager is not None:
-            try:
-                formatted = self._prompt_manager.format_prompt(
-                    prompt_name=prompt_name, variables=variables
-                )
-                logger.debug(f"Formatted prompt '{prompt_name}' from Opik")
-                return formatted
-            except Exception as e:
-                logger.warning(
-                    f"Failed to format prompt '{prompt_name}' from Opik: {e}. "
-                    "Falling back to local file."
-                )
+        context: dict = {}
 
-        # Fallback to local file
-        if local_file_path is None:
-            raise ValueError("local_file_path is required when Opik prompts are not available")
+        if total_sessions <= 10:
+            past_sessions = db.list_records(
+                "drill_sessions",
+                filters={"user_id": user_id, "status": "completed"},
+                columns=["feedback", "completed_at"],
+                order_by="completed_at",
+                order_desc=True,
+                limit=10,
+            )
+            context["past_evaluations"] = [
+                s.get("feedback") for s in past_sessions if s.get("feedback")
+            ]
+        else:
+            profile = db.list_records(
+                "user_profile",
+                filters={"user_id": user_id},
+                columns=["user_summary"],
+                limit=1,
+            )
+            context["user_summary"] = profile[0].get("user_summary") if profile else None
 
-        from pathlib import Path
+            last_session = db.list_records(
+                "drill_sessions",
+                filters={"user_id": user_id, "status": "completed"},
+                columns=["feedback"],
+                order_by="completed_at",
+                order_desc=True,
+                limit=1,
+            )
+            if last_session and last_session[0].get("feedback"):
+                context["last_feedback"] = last_session[0]["feedback"]
 
-        prompt_path = Path(local_file_path)
-        prompt_template = prompt_path.read_text()
+        return context
 
-        # Format using either double-brace or single-brace syntax
-        # Try Python format() first (single brace), then fall back to string replacement
-        try:
-            formatted = prompt_template.format(**variables)
-        except KeyError:
-            # Fallback to double-brace replacement for legacy prompts
-            formatted = prompt_template
-            for key, value in variables.items():
-                formatted = formatted.replace(f"{{{{{key}}}}}", str(value))
+    async def _run_feedback_agents(
+        self,
+        user_id: str,
+        drill: dict,
+        skills: list[dict],
+        transcript: str,
+        context: dict,
+    ) -> tuple[DrillFeedback, str]:
+        """Run FeedbackAgent then UserSummaryAgent.
 
-        logger.debug(f"Formatted prompt from local file: {local_file_path}")
-        return formatted
+        Returns:
+            Tuple of (DrillFeedback, updated_user_summary_string).
+            updated_user_summary may be empty string if summary step fails.
+        """
+        from src.prep.features.feedback.agents import feedback_agent, summary_agent
+        from src.prep.services.llm.schemas import UserProfileUpdate
 
-    def _log_llm_response_for_debug(
-        self, response_content: str, context: str, model_used: str
-    ) -> None:
-        """Log LLM response for debugging parsing failures."""
-        preview = response_content[:500] if len(response_content) > 500 else response_content
-        logger.info(
-            "LLM response preview for %s (model=%s, length=%d): %s",
-            context,
-            model_used,
-            len(response_content),
-            preview,
+        # ---- Build feedback agent inputs ----
+        skills_with_criteria = "\n\n".join(
+            f"**{s['name']}**\n{s.get('description', 'No description provided')}"
+            for s in skills
         )
-        logger.debug("Full LLM response for %s: %s", context, response_content)
 
-    @opik_track(
-        name="drill_session_evaluation",
-        tags=["feedback", "drill-completion"],
-    )
+        past_evaluations = ""
+        if context.get("past_evaluations"):
+            past_eval_list = context["past_evaluations"][:3]
+            past_evaluations = "\n".join(
+                f"Session {i + 1}: {ev.get('summary', 'No summary')}"
+                for i, ev in enumerate(past_eval_list)
+            )
+        elif context.get("user_summary"):
+            past_evaluations = f"User profile: {context['user_summary']}"
+
+        # ---- Step 1: Feedback ----
+        feedback_state = await run_agent_once_with_retry(
+            feedback_agent,
+            user_id=user_id,
+            session_state={
+                "drill_name": drill.get("title", "Unknown"),
+                "drill_description": drill.get("description", ""),
+                "skills_with_criteria": skills_with_criteria,
+                "transcript": transcript,
+                "past_evaluations": past_evaluations or "None",
+            },
+        )
+
+        raw_feedback = feedback_state.get("drill_feedback", "")
+        if isinstance(raw_feedback, dict):
+            feedback = DrillFeedback.model_validate(raw_feedback)
+        else:
+            feedback = DrillFeedback.model_validate_json(raw_feedback)
+
+        # ---- Step 2: User Summary ----
+        skill_evals_text = "\n".join(
+            f"- {s.skill_name}: {s.evaluation.value}" for s in feedback.skills
+        )
+
+        # Get current user summary for context
+        db = get_query_builder()
+        profile = db.list_records(
+            "user_profile", filters={"user_id": user_id}, columns=["user_summary"], limit=1
+        )
+        current_summary = profile[0].get("user_summary") if profile else None
+        total_sessions = db.count_records(
+            "drill_sessions", filters={"user_id": user_id, "status": "completed"}
+        )
+
+        try:
+            summary_state = await run_agent_once_with_retry(
+                summary_agent,
+                user_id=user_id,
+                session_state={
+                    "current_summary": current_summary or "No previous summary",
+                    "total_sessions": str(total_sessions),
+                    "session_summary": feedback.summary,
+                    "skill_evaluations": skill_evals_text,
+                },
+            )
+            raw_summary = summary_state.get("user_summary", "")
+            if isinstance(raw_summary, dict):
+                profile_update = UserProfileUpdate.model_validate(raw_summary)
+            else:
+                profile_update = UserProfileUpdate.model_validate_json(raw_summary)
+            updated_summary = profile_update.summary
+        except Exception as e:
+            logger.error("User summary step failed (non-blocking): %s", e, exc_info=True)
+            updated_summary = current_summary or ""
+
+        return feedback, updated_summary
+
     async def evaluate_drill_session(
         self,
         session_id: str,
@@ -121,7 +174,7 @@ class FeedbackService:
         Evaluate drill session performance and update skill scores.
 
         Two-phase evaluation:
-        Phase 1: LLM calls (5-10s, no locks)
+        Phase 1: LLM calls via ADK agents (5-10s, no locks)
         Phase 2: Atomic DB updates (<100ms)
 
         Args:
@@ -135,7 +188,7 @@ class FeedbackService:
         """
         try:
             db = get_query_builder()
-            logger.info(f"Starting evaluation for session {session_id}")
+            logger.info("Starting evaluation for session %s", session_id)
 
             # ========== PHASE 1: LLM CALLS (NO DATABASE LOCKS) ==========
 
@@ -171,9 +224,10 @@ class FeedbackService:
             # 3. Build feedback context
             context = self._build_feedback_context(user_id, total_sessions, db)
 
-            # 4. Generate feedback (LLM call with structured output)
+            # 4. Run feedback + summary agents
             try:
-                feedback_dict, feedback_metadata = await self._generate_drill_feedback(
+                validated_feedback, updated_summary = await self._run_feedback_agents(
+                    user_id=user_id,
                     drill=drill,
                     skills=skills_list,
                     transcript=transcript,
@@ -188,19 +242,12 @@ class FeedbackService:
                 )
                 raise FeedbackEvaluationError(f"LLM feedback generation failed: {e}") from e
 
-            # 5. Validate feedback schema
-            try:
-                validated_feedback = DrillFeedback.model_validate(feedback_dict)
-            except ValidationError as e:
-                logger.error(
-                    "Feedback validation failed for session %s: %s", session_id, e, exc_info=True
-                )
-                raise FeedbackEvaluationError(f"Feedback validation failed: {e}") from e
-
-            # 6. Validate skills against expected set
+            # 5. Validate skills against expected set
             expected_skill_names = {skill["name"] for skill in skills_list}
             valid_skill_evals = [
-                sf for sf in validated_feedback.skills if sf.skill_name in expected_skill_names
+                sf
+                for sf in validated_feedback.skills
+                if sf.skill_name in expected_skill_names
             ]
 
             if len(valid_skill_evals) == 0:
@@ -210,44 +257,42 @@ class FeedbackService:
                     f"Got: {[s.skill_name for s in validated_feedback.skills]}"
                 )
                 logger.error(
-                    "Session %s returned no valid skill evaluations: %s", session_id, error_msg
+                    "Session %s returned no valid skill evaluations: %s",
+                    session_id,
+                    error_msg,
                 )
                 raise FeedbackEvaluationError(error_msg)
 
-            # Warn if some skills missing (non-blocking)
             if len(valid_skill_evals) < len(expected_skill_names):
                 missing = expected_skill_names - {s.skill_name for s in valid_skill_evals}
-                logger.warning(f"LLM did not evaluate all skills. Missing: {missing}")
+                logger.warning("LLM did not evaluate all skills. Missing: %s", missing)
 
-            # 7. Prepare skill score updates
+            # 6. Prepare skill score updates
             skill_score_updates = []
             skill_evaluations_for_storage = []
 
             for skill_feedback in valid_skill_evals:
                 skill = next(s for s in skills_list if s["name"] == skill_feedback.skill_name)
 
-                # Get current score
                 current_score_records = db.list_records(
                     "user_skill_scores",
                     filters={"user_id": user_id, "skill_id": skill["id"]},
                     columns=["score"],
                     limit=1,
                 )
-                current_score = current_score_records[0]["score"] if current_score_records else 0.0
+                current_score = (
+                    current_score_records[0]["score"] if current_score_records else 0.0
+                )
 
-                # Calculate score change: +1, +0.5, or -1
                 score_change_map = {
                     SkillPerformance.DEMONSTRATED: 1.0,
                     SkillPerformance.PARTIAL: 0.5,
                     SkillPerformance.MISSED: -1.0,
                 }
                 score_change = score_change_map[skill_feedback.evaluation]
-
-                # Apply bounds: floor 0, cap 7
                 new_score = max(0.0, min(7.0, current_score + score_change))
 
                 skill_score_updates.append({"skill_id": skill["id"], "new_score": new_score})
-
                 skill_evaluations_for_storage.append(
                     {
                         "skill_id": skill["id"],
@@ -258,18 +303,6 @@ class FeedbackService:
                         "score_after": new_score,
                     }
                 )
-
-            # 8. Generate updated user summary (LLM call with structured output)
-            try:
-                updated_summary, _ = await self._extract_user_summary(
-                    user_id=user_id,
-                    current_summary=context.get("user_summary"),
-                    current_feedback=validated_feedback,
-                    total_sessions=total_sessions,
-                )
-            except Exception as e:
-                logger.error(f"User summary extraction failed (non-blocking): {e}")
-                updated_summary = context.get("user_summary")  # Keep existing
 
             # ========== PHASE 2: ATOMIC DATABASE UPDATES (FAST) ==========
 
@@ -283,7 +316,10 @@ class FeedbackService:
 
             # 2. Store skill evaluations and feedback in session
             feedback_jsonb = validated_feedback.model_dump()
-            feedback_jsonb["evaluation_meta"] = feedback_metadata
+            feedback_jsonb["evaluation_meta"] = {
+                "model": settings.llm_feedback_model,
+                "evaluated_at": datetime.now(UTC).isoformat(),
+            }
 
             db.update_record(
                 "drill_sessions",
@@ -306,523 +342,12 @@ class FeedbackService:
             # 4. Invalidate recommendation cache
             invalidate_recommendation_cache(user_id)
 
-            logger.info(f"Evaluation completed successfully for session {session_id}")
+            logger.info("Evaluation completed successfully for session %s", session_id)
 
         except FeedbackEvaluationError:
             raise
         except Exception as e:
-            logger.error(f"Unexpected error during evaluation for session {session_id}: {e}")
+            logger.error(
+                "Unexpected error during evaluation for session %s: %s", session_id, e
+            )
             raise FeedbackEvaluationError(f"Unexpected error during evaluation: {e}") from e
-
-    @opik_track(
-        name="build_feedback_context",
-        tags=["context", "database"],
-    )
-    def _build_feedback_context(self, user_id: str, total_sessions: int, db) -> dict:
-        """
-        Build context for feedback generation.
-
-        If <=10 sessions: Use past evaluations
-        If >10 sessions: Use user_summary + last feedback
-
-        Args:
-            user_id: User ID
-            total_sessions: Total completed sessions
-            db: Database query builder
-
-        Returns:
-            Context dictionary with past_evaluations or user_summary
-        """
-        context = {}
-
-        if total_sessions <= 10:
-            # Get past evaluations (up to 10)
-            past_sessions = db.list_records(
-                "drill_sessions",
-                filters={"user_id": user_id, "status": "completed"},
-                columns=["feedback", "completed_at"],
-                order_by="completed_at",
-                order_desc=True,
-                limit=10,
-            )
-            context["past_evaluations"] = [
-                s.get("feedback") for s in past_sessions if s.get("feedback")
-            ]
-        else:
-            # Get user summary
-            profile = db.list_records(
-                "user_profile",
-                filters={"user_id": user_id},
-                columns=["user_summary"],
-                limit=1,
-            )
-            context["user_summary"] = profile[0].get("user_summary") if profile else None
-
-            # Get last feedback
-            last_session = db.list_records(
-                "drill_sessions",
-                filters={"user_id": user_id, "status": "completed"},
-                columns=["feedback"],
-                order_by="completed_at",
-                order_desc=True,
-                limit=1,
-            )
-            if last_session and last_session[0].get("feedback"):
-                context["last_feedback"] = last_session[0]["feedback"]
-
-        return context
-
-    @staticmethod
-    def _parse_json_response_dict(raw_content: str, context: str = "unknown") -> dict:
-        """Parse JSON response, including fenced JSON blocks."""
-        content = raw_content.strip()
-        if not content:
-            raise ValueError("LLM response content is empty")
-
-        candidates: list[str] = [content]
-        fenced_blocks = re.findall(
-            r"```(?:json)?\s*(.*?)\s*```", content, flags=re.IGNORECASE | re.DOTALL
-        )
-        candidates.extend(block.strip() for block in fenced_blocks if block.strip())
-
-        start_index = content.find("{")
-        end_index = content.rfind("}")
-        if start_index != -1 and end_index > start_index:
-            candidates.append(content[start_index : end_index + 1].strip())
-
-        unique_candidates: list[str] = []
-        seen: set[str] = set()
-        for candidate in candidates:
-            if candidate and candidate not in seen:
-                unique_candidates.append(candidate)
-                seen.add(candidate)
-
-        for candidate in unique_candidates:
-            try:
-                parsed = json.loads(candidate)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(parsed, dict):
-                return parsed
-        preview = (
-            raw_content[:200] if len(raw_content) > 200 else raw_content
-        )
-        error_msg = (
-            f"LLM response did not contain valid JSON (context={context}). "
-            f"Tried {len(unique_candidates)} candidates. "
-            f"Raw content preview: {preview!r}"
-        )
-        logger.error(error_msg)
-        raise ValueError(error_msg)
-
-    @staticmethod
-    def _normalize_feedback_payload(payload: dict) -> dict:
-        """Normalize known enum aliases before schema validation."""
-        normalized = dict(payload)
-        skills = normalized.get("skills")
-        if not isinstance(skills, list):
-            return normalized
-
-        evaluation_aliases = {
-            "partially": "Partial",
-            "did not demonstrate": "Missed",
-            "not demonstrated": "Missed",
-        }
-
-        normalized_skills: list = []
-        for skill in skills:
-            if not isinstance(skill, dict):
-                normalized_skills.append(skill)
-                continue
-
-            normalized_skill = dict(skill)
-            evaluation = normalized_skill.get("evaluation")
-            if isinstance(evaluation, str):
-                alias = evaluation_aliases.get(evaluation.strip().lower())
-                if alias:
-                    normalized_skill["evaluation"] = alias
-            normalized_skills.append(normalized_skill)
-
-        normalized["skills"] = normalized_skills
-        return normalized
-
-    @staticmethod
-    def _is_valid_plain_text_summary(text: str) -> bool:
-        """Guardrails for accepting plain-text summary fallback."""
-        stripped = text.strip()
-        if len(stripped) < 25:
-            return False
-        if stripped.startswith(("{", "[", "```")):
-            return False
-        if not any(punct in stripped for punct in (".", "!", "?")):
-            return False
-        return True
-
-    @staticmethod
-    def _build_llm_metadata(response, default_model: str, timestamp_field: str) -> dict:
-        usage = response.usage or {}
-        return {
-            "model": response.metadata.get("model", default_model),
-            "thinking_level": response.metadata.get("thinking_level"),
-            "thought_summaries": response.metadata.get("thought_summaries", []),
-            "thinking_tokens": usage.get("thoughts_token_count", 0),
-            timestamp_field: datetime.now(UTC).isoformat(),
-        }
-
-    @opik_track(
-        name="generate_drill_feedback",
-        tags=["llm", "feedback", "gemini"],
-    )
-    async def _generate_drill_feedback(
-        self, drill: dict, skills: list[dict], transcript: str, context: dict
-    ) -> tuple[dict, dict]:
-        """
-        Generate drill feedback using LLM service with prompt template.
-
-        Uses gemini-2.0-flash-exp with structured output and thinking mode
-        for fast, validated feedback generation.
-
-        Args:
-            drill: Drill information
-            skills: List of skills being tested
-            transcript: Session transcript
-            context: Feedback context (past evaluations or user summary)
-
-        Returns:
-            Tuple of (feedback dictionary, metadata dict with thought summaries)
-        """
-        from src.prep.services.llm import DrillFeedback, get_llm_provider
-
-        try:
-            # Build skills with criteria text
-            skills_with_criteria = "\n\n".join(
-                [
-                    f"**{s['name']}**\n{s.get('description', 'No description provided')}"
-                    for s in skills
-                ]
-            )
-
-            # Build context text for past evaluations
-            past_evaluations = ""
-            if context.get("past_evaluations"):
-                past_eval_list = context["past_evaluations"][:3]
-                past_evaluations = "\n".join(
-                    [
-                        f"Session {i + 1}: {eval.get('summary', 'No summary')}"
-                        for i, eval in enumerate(past_eval_list)
-                    ]
-                )
-            elif context.get("user_summary"):
-                past_evaluations = f"User profile: {context['user_summary']}"
-
-            # Format prompt using Opik or local file
-            prompt = self._format_prompt_template(
-                prompt_name="feedback-product",
-                variables={
-                    "drill_name": drill.get("title", "Unknown"),
-                    "drill_description": drill.get("description", ""),
-                    "skills_with_criteria": skills_with_criteria,
-                    "transcript": transcript,
-                    "past_evaluations": past_evaluations or "None",
-                },
-                local_file_path="prompts/feedback_product.md",
-            )
-
-            # Initialize LLM provider with structured output
-            llm = get_llm_provider(
-                provider_name="gemini",
-                model=settings.llm_feedback_model,
-                system_prompt="You are an expert interview coach providing structured feedback.",
-                response_format=DrillFeedback.model_json_schema(),
-                enable_thinking=False,
-                temperature=0.7,
-                max_tokens=12000,
-            )
-
-            # Generate feedback
-            response = await llm.generate(prompt)
-
-            # Log for debugging - defensive against malformed response
-            try:
-                model_used = (
-                    response.metadata.get("model", settings.llm_feedback_model)
-                    if response.metadata
-                    else settings.llm_feedback_model
-                )
-                response_content = response.content if response.content else ""
-                self._log_llm_response_for_debug(
-                    response_content, context="feedback_generation", model_used=model_used
-                )
-            except Exception as log_error:
-                logger.warning("Failed to log LLM response: %s", log_error)
-
-            # Check for empty response before parsing
-            if not response.content or not response.content.strip():
-                raise ValueError("LLM returned empty response for feedback_generation")
-
-            try:
-                feedback_payload = self._parse_json_response_dict(
-                    response.content, context="feedback_generation"
-                )
-                normalized_feedback = self._normalize_feedback_payload(feedback_payload)
-                validated_feedback = DrillFeedback.model_validate(normalized_feedback)
-            except (ValidationError, ValueError) as primary_parse_error:
-                primary_model_used = response.metadata.get("model", settings.llm_feedback_model)
-                fallback_model = settings.llm_fallback_model
-                if fallback_model and fallback_model != primary_model_used:
-                    logger.warning(
-                        (
-                            "Invalid structured feedback output; retrying with explicit fallback model. "
-                            "primary_model=%s fallback_model=%s error=%s"
-                        ),
-                        primary_model_used,
-                        fallback_model,
-                        primary_parse_error,
-                    )
-                    fallback_llm = get_llm_provider(
-                        provider_name="gemini",
-                        model=fallback_model,
-                        system_prompt="You are an expert interview coach providing structured feedback.",
-                        response_format=DrillFeedback.model_json_schema(),
-                        enable_thinking=False,
-                        temperature=0.7,
-                        max_tokens=12000,
-                        fallback_model=None,
-                    )
-                    response = await fallback_llm.generate(prompt)
-
-                    # Log fallback response
-                    try:
-                        fallback_model_used = (
-                            response.metadata.get("model", fallback_model)
-                            if response.metadata
-                            else fallback_model
-                        )
-                        self._log_llm_response_for_debug(
-                            response.content if response.content else "",
-                            context="feedback_generation_fallback",
-                            model_used=fallback_model_used,
-                        )
-                    except Exception as log_error:
-                        logger.warning("Failed to log fallback LLM response: %s", log_error)
-
-                    if not response.content or not response.content.strip():
-                        raise ValueError(
-                            "Fallback LLM returned empty response for feedback_generation"
-                        )
-
-                    feedback_payload = self._parse_json_response_dict(
-                        response.content, context="feedback_generation_fallback"
-                    )
-                    normalized_feedback = self._normalize_feedback_payload(feedback_payload)
-                    validated_feedback = DrillFeedback.model_validate(normalized_feedback)
-                else:
-                    raise primary_parse_error
-
-            metadata = self._build_llm_metadata(
-                response=response,
-                default_model=settings.llm_feedback_model,
-                timestamp_field="evaluated_at",
-            )
-            return validated_feedback.model_dump(), metadata
-
-        except Exception as e:
-            logger.error(f"LLM feedback generation failed: {e}", exc_info=True)
-            # Fallback to placeholder
-            fallback_feedback = {
-                "summary": f"Completed {drill.get('title', 'drill')}. Performance was evaluated across {len(skills)} skills.",
-                "skills": [
-                    {
-                        "skill_name": skill["name"],
-                        "evaluation": "Partial",
-                        "feedback": f"Demonstrated understanding of {skill['name']} with room for improvement.",
-                        "improvement_suggestion": f"Practice {skill['name']} in more scenarios.",
-                    }
-                    for skill in skills
-                ],
-            }
-            fallback_metadata = {
-                "model": "fallback",
-                "evaluated_at": datetime.now(UTC).isoformat(),
-                "error": str(e),
-            }
-            return fallback_feedback, fallback_metadata
-
-    @opik_track(
-        name="extract_user_summary",
-        tags=["llm", "profiling", "gemini"],
-    )
-    async def _extract_user_summary(
-        self,
-        user_id: str,
-        current_summary: str | None,
-        current_feedback: DrillFeedback,
-        total_sessions: int,
-    ) -> tuple[str, dict | None]:
-        """
-        Extract/update user summary using LLM service with prompt template.
-
-        Uses gemini-2.0-flash-exp with structured output and thinking mode
-        for validated, insightful summary generation.
-
-        Args:
-            user_id: User ID
-            current_summary: Current user summary (if exists)
-            current_feedback: Current drill feedback
-            total_sessions: Total completed sessions
-
-        Returns:
-            Tuple of (updated summary string, metadata dict with thought summaries)
-        """
-        from src.prep.services.llm import UserProfileUpdate, get_llm_provider
-
-        try:
-            # Build skill evaluations text
-            skill_evaluations = "\n".join(
-                [f"- {s.skill_name}: {s.evaluation.value}" for s in current_feedback.skills]
-            )
-
-            # Format prompt using Opik or local file
-            prompt = self._format_prompt_template(
-                prompt_name="user-summary",
-                variables={
-                    "current_summary": current_summary or "No previous summary",
-                    "total_sessions": str(total_sessions),
-                    "session_summary": current_feedback.summary,
-                    "skill_evaluations": skill_evaluations,
-                },
-                local_file_path="prompts/user_summary.md",
-            )
-
-            # Initialize LLM provider with structured output
-            llm = get_llm_provider(
-                provider_name="gemini",
-                model=settings.llm_user_summary_model,
-                system_prompt="You are an AI coach synthesizing user performance data.",
-                response_format=UserProfileUpdate.model_json_schema(),
-                enable_thinking=False,
-                temperature=0.7,
-                max_tokens=4096,
-            )
-
-            # Generate summary
-            response = await llm.generate(prompt)
-
-            # Log for debugging - defensive against malformed response
-            try:
-                model_used = (
-                    response.metadata.get("model", settings.llm_user_summary_model)
-                    if response.metadata
-                    else settings.llm_user_summary_model
-                )
-                response_content = response.content if response.content else ""
-                self._log_llm_response_for_debug(
-                    response_content,
-                    context="user_summary",
-                    model_used=model_used,
-                )
-            except Exception as log_error:
-                logger.warning("Failed to log LLM response for user_summary: %s", log_error)
-
-            # Check for empty response before parsing
-            if not response.content or not response.content.strip():
-                raise ValueError("LLM returned empty response for user_summary")
-
-            try:
-                profile_payload = self._parse_json_response_dict(
-                    response.content, context="user_summary"
-                )
-                profile_update = UserProfileUpdate.model_validate(profile_payload)
-                metadata = self._build_llm_metadata(
-                    response=response,
-                    default_model=settings.llm_user_summary_model,
-                    timestamp_field="updated_at",
-                )
-                return profile_update.summary, metadata
-            except (ValidationError, ValueError) as primary_parse_error:
-                summary_text = response.content.strip()
-                if self._is_valid_plain_text_summary(summary_text):
-                    metadata = self._build_llm_metadata(
-                        response=response,
-                        default_model=settings.llm_user_summary_model,
-                        timestamp_field="updated_at",
-                    )
-                    return summary_text, metadata
-
-                primary_model_used = response.metadata.get("model", settings.llm_user_summary_model)
-                fallback_model = settings.llm_fallback_model
-                if fallback_model and fallback_model != primary_model_used:
-                    logger.warning(
-                        (
-                            "Invalid structured user-summary output; retrying with explicit fallback model. "
-                            "primary_model=%s fallback_model=%s error=%s"
-                        ),
-                        primary_model_used,
-                        fallback_model,
-                        primary_parse_error,
-                    )
-                    fallback_llm = get_llm_provider(
-                        provider_name="gemini",
-                        model=fallback_model,
-                        system_prompt="You are an AI coach synthesizing user performance data.",
-                        response_format=UserProfileUpdate.model_json_schema(),
-                        enable_thinking=False,
-                        temperature=0.7,
-                        max_tokens=4096,
-                        fallback_model=None,
-                    )
-                    fallback_response = await fallback_llm.generate(prompt)
-
-                    # Log fallback response
-                    try:
-                        fallback_model_used = (
-                            fallback_response.metadata.get("model", fallback_model)
-                            if fallback_response.metadata
-                            else fallback_model
-                        )
-                        self._log_llm_response_for_debug(
-                            fallback_response.content if fallback_response.content else "",
-                            context="user_summary_fallback",
-                            model_used=fallback_model_used,
-                        )
-                    except Exception as log_error:
-                        logger.warning(
-                            "Failed to log fallback LLM response for user_summary: %s", log_error
-                        )
-
-                    if not fallback_response.content or not fallback_response.content.strip():
-                        raise ValueError("Fallback LLM returned empty response for user_summary")
-
-                    try:
-                        fallback_payload = self._parse_json_response_dict(
-                            fallback_response.content, context="user_summary_fallback"
-                        )
-                        fallback_profile = UserProfileUpdate.model_validate(fallback_payload)
-                        metadata = self._build_llm_metadata(
-                            response=fallback_response,
-                            default_model=settings.llm_user_summary_model,
-                            timestamp_field="updated_at",
-                        )
-                        return fallback_profile.summary, metadata
-                    except (ValidationError, ValueError):
-                        fallback_summary = fallback_response.content.strip()
-                        if self._is_valid_plain_text_summary(fallback_summary):
-                            metadata = self._build_llm_metadata(
-                                response=fallback_response,
-                                default_model=settings.llm_user_summary_model,
-                                timestamp_field="updated_at",
-                            )
-                            return fallback_summary, metadata
-
-                raise primary_parse_error
-
-        except Exception as e:
-            logger.error(f"User summary extraction failed: {e}", exc_info=True)
-            # Fallback: keep existing or create basic one
-            if current_summary:
-                return current_summary, None
-            else:
-                return (
-                    f"User has completed {total_sessions} sessions. Shows developing skills across various areas.",
-                    None,
-                )

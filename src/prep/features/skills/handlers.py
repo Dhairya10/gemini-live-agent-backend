@@ -1,6 +1,7 @@
 """API handlers for skills endpoints."""
 
 import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from src.prep.features.skills.schemas import (

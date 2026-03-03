@@ -6,8 +6,8 @@ from src.prep.features.home_screen.handlers import PaginatedResponse, SingleResp
 from src.prep.services.auth.dependencies import get_current_user
 from src.prep.services.auth.models import JWTUser
 from src.prep.services.database import get_query_builder
-from src.prep.services.rate_limiter import default_rate_limit
 from src.prep.services.database.models import DrillResponse, ProblemType
+from src.prep.services.rate_limiter import default_rate_limit
 
 router = APIRouter()
 
@@ -269,6 +269,7 @@ async def get_library_drills(
 
 
 from src.prep.features.library.schemas import LibraryMetadataResponse
+
 
 @router.get("/metadata", response_model=SingleResponse[LibraryMetadataResponse])
 @default_rate_limit
