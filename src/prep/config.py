@@ -32,16 +32,25 @@ class Settings(BaseSettings):
     # Google GenAI API Key (for LLM calls and ADK voice agent)
     google_api_key: str = ""
 
+    # Google Vertex AI Configuration
+    google_genai_use_vertexai: bool = False  # Set to True for Vertex AI
+    google_cloud_project: str = ""
+    google_cloud_location: str = "us-central1"
+
     # ADK Voice Agent Settings
     gemini_live_model: str = "gemini-2.5-flash-native-audio-preview-09-2025"
     gemini_live_voice: str = ""
     voice_session_max_duration_minutes: int = 25
-    voice_session_hard_limit_minutes: int = 15
-    voice_session_warning_minutes_before_hard_limit: int = 1
-    voice_session_max_concurrent: int = 50
+    voice_session_hard_limit_minutes: int = 20
+    voice_session_warning_minutes_before_hard_limit: int = 3
+    voice_session_max_concurrent: int = 1000  # 50 for AI Studio, 1000+ for Vertex AI
     min_feedback_duration_seconds: int = 120  # 2 minutes - sessions shorter than this skip feedback
 
-
+    # ADK Voice Agent Feature Flags (all disabled by default)
+    voice_enable_session_resumption: bool = False
+    voice_enable_context_compression: bool = False
+    voice_enable_proactivity: bool = False
+    voice_enable_affective_dialog: bool = False
 
     # Model Configuration
     llm_feedback_model: str = "gemini-3-pro-preview"

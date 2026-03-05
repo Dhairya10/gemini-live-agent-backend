@@ -16,14 +16,31 @@ logger = logging.getLogger(__name__)
 
 def _ensure_genai_env() -> None:
     """Ensure Google GenAI environment variables are set for ADK."""
-    google_env = os.getenv("GOOGLE_API_KEY", "").strip()
-
-    if not google_env:
-        api_key = settings.google_api_key.strip()
-        if api_key:
-            os.environ["GOOGLE_API_KEY"] = api_key
+    # Configure for Vertex AI or AI Studio based on settings
+    if settings.google_genai_use_vertexai:
+        # Vertex AI Configuration
+        os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "TRUE"
+        if settings.google_cloud_project:
+            os.environ["GOOGLE_CLOUD_PROJECT"] = settings.google_cloud_project
         else:
-            logger.warning("No Google GenAI API key is configured; ADK may fail to authenticate")
+            logger.warning("GOOGLE_CLOUD_PROJECT not set; Vertex AI may fail to authenticate")
+        if settings.google_cloud_location:
+            os.environ["GOOGLE_CLOUD_LOCATION"] = settings.google_cloud_location
+        logger.info(
+            f"Using Vertex AI with project={settings.google_cloud_project}, "
+            f"location={settings.google_cloud_location}"
+        )
+    else:
+        # AI Studio Configuration (API key-based)
+        google_env = os.getenv("GOOGLE_API_KEY", "").strip()
+        if not google_env:
+            api_key = settings.google_api_key.strip()
+            if api_key:
+                os.environ["GOOGLE_API_KEY"] = api_key
+            else:
+                logger.warning(
+                    "No Google GenAI API key is configured; ADK may fail to authenticate"
+                )
 
 
 def create_interview_agent(drill_context: dict) -> Agent:

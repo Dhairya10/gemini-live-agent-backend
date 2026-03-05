@@ -470,8 +470,8 @@ async def _send_timeout_warning(
         if not voice_session.is_active:
             return
         warning_text = (
-            f"[SYSTEM: 2 minutes remaining before hard session cutoff at {max_minutes} minutes. "
-            "Please wrap up and call end_interview.]"
+            f"[SYSTEM: Session ends in {warning_minutes_before_limit} minutes. "
+            "Acknowledge the user, provide a brief summary, and call end_interview now.]"
         )
         voice_session.live_queue.send_content(types.Content(parts=[types.Part(text=warning_text)]))
         logger.info("Sent timeout warning for session %s", voice_session.session_id)

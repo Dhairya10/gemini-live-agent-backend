@@ -11,7 +11,7 @@ from uuid import UUID
 
 from google.adk.agents import LiveRequestQueue
 from google.adk.runners import Runner
-from google.adk.sessions import InMemorySessionService
+from google.adk.sessions import InMemorySessionService, VertexAiSessionService
 
 from src.prep.config import settings
 
@@ -88,7 +88,21 @@ class VoiceSessionManager:
     """
 
     def __init__(self) -> None:
-        self.session_service = InMemorySessionService()
+        # Use VertexAiSessionService for Vertex AI, InMemorySessionService for AI Studio
+        if settings.google_genai_use_vertexai:
+            self.session_service = VertexAiSessionService(
+                project=settings.google_cloud_project,
+                location=settings.google_cloud_location,
+            )
+            logger.info(
+                "Using VertexAiSessionService with project=%s, location=%s",
+                settings.google_cloud_project,
+                settings.google_cloud_location,
+            )
+        else:
+            self.session_service = InMemorySessionService()
+            logger.info("Using InMemorySessionService for AI Studio")
+
         self._active_sessions: dict[UUID, VoiceSession] = {}
         self._lock = asyncio.Lock()
 
