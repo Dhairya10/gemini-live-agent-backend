@@ -88,20 +88,10 @@ class VoiceSessionManager:
     """
 
     def __init__(self) -> None:
-        # Use VertexAiSessionService for Vertex AI, InMemorySessionService for AI Studio
-        if settings.google_genai_use_vertexai:
-            self.session_service = VertexAiSessionService(
-                project=settings.google_cloud_project,
-                location=settings.google_cloud_location,
-            )
-            logger.info(
-                "Using VertexAiSessionService with project=%s, location=%s",
-                settings.google_cloud_project,
-                settings.google_cloud_location,
-            )
-        else:
-            self.session_service = InMemorySessionService()
-            logger.info("Using InMemorySessionService for AI Studio")
+        # Always use InMemorySessionService for WebSocket API.
+        # VertexAiSessionService requires deploying an Agent Engine to GCP first.
+        self.session_service = InMemorySessionService()
+        logger.info("Using InMemorySessionService to store voice agent state (WebSocket connected natively to Vertex AI)")
 
         self._active_sessions: dict[UUID, VoiceSession] = {}
         self._lock = asyncio.Lock()

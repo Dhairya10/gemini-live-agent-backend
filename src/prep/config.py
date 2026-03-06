@@ -38,8 +38,8 @@ class Settings(BaseSettings):
     google_cloud_location: str = "us-central1"
 
     # ADK Voice Agent Settings
-    gemini_live_model: str = "gemini-2.5-flash-native-audio-preview-09-2025"
-    gemini_live_voice: str = ""
+    gemini_live_model: str = "gemini-live-2.5-flash-native-audio"
+    gemini_live_voice: str = "Achird"
     voice_session_max_duration_minutes: int = 25
     voice_session_hard_limit_minutes: int = 20
     voice_session_warning_minutes_before_hard_limit: int = 3
@@ -53,10 +53,10 @@ class Settings(BaseSettings):
     voice_enable_affective_dialog: bool = False
 
     # Model Configuration
-    llm_feedback_model: str = "gemini-3-pro-preview"
-    llm_drill_selection_model: str = "gemini-3-pro-preview"
-    llm_user_summary_model: str = "gemini-3-pro-preview"
-    llm_fallback_model: str = "gemini-3-flash-preview"
+    llm_feedback_model: str = "gemini-3.1-pro-preview"
+    llm_drill_selection_model: str = "gemini-3.1-pro-preview"
+    llm_user_summary_model: str = "gemini-3.1-pro-preview"
+    llm_fallback_model: str = "gemini-3.1-flash-preview"
 
 
 settings = Settings()
