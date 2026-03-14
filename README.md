@@ -6,6 +6,10 @@ Front-end: [gemini-live-frontend](https://github.com/Dhairya10/gemini-live-agent
 
 ---
 
+## Architecture
+
+![Architecture Diagram](arch_diagram.png)
+
 ## How It Works
 
 1. User picks a mock interview from a curated library
