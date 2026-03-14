@@ -64,6 +64,13 @@ uv run uvicorn src.prep.main:app --reload --host 0.0.0.0 --port 8000
 
 API docs: `http://localhost:8000/docs`
 
+## Test Account
+
+| Field    | Value             |
+|----------|-------------------|
+| Email    | alpha@primed.club |
+| Password | test@2026         |
+
 ## Testing
 
 ```bash
