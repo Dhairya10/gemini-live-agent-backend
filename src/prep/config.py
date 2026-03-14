@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     voice_session_hard_limit_minutes: int = 20
     voice_session_warning_minutes_before_hard_limit: int = 3
     voice_session_max_concurrent: int = 100
-    min_feedback_duration_seconds: int = 60  # 2 minutes - sessions shorter than this skip feedback
+    min_feedback_duration_seconds: int = 60  # 1 minute - sessions shorter than this skip feedback
 
     # ADK Voice Agent Feature Flags (all disabled by default)
     voice_enable_session_resumption: bool = True
