@@ -2,13 +2,13 @@
 
 Primed is an AI interview coach that conducts real-time voice interviews and gives actionable feedback
 
-Front-end: [primed-app](https://github.com/Dhairya10/primed-app)
+Front-end: [gemini-live-frontend](https://github.com/Dhairya10/gemini-live-agent-frontend)
 
 ---
 
 ## How It Works
 
-1. User picks a PM drill from a curated library
+1. User picks a mock interview from a curated library
 2. A real-time bidirectional voice session starts, powered by ADK and Live API
 3. On session end, three ADK agents are invoked
     - **FeedbackAgent** that evaluates the transcript against the skill rubric
