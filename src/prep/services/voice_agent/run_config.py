@@ -48,7 +48,7 @@ def create_interview_run_config(session_id: str, user_id: str) -> RunConfig:
 
     config_kwargs: dict = {
         "streaming_mode": StreamingMode.BIDI,
-        "response_modalities": [types.Modality.AUDIO],
+        "response_modalities": ["AUDIO"],
         "input_audio_transcription": types.AudioTranscriptionConfig(),
         "output_audio_transcription": types.AudioTranscriptionConfig(),
         "speech_config": types.SpeechConfig(

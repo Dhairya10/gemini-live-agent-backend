@@ -24,6 +24,9 @@ from src.prep.services.voice_agent.session_manager import voice_session_manager
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+# Keep strong references to background tasks to prevent Python GC from killing them
+_background_tasks = set()
+
 
 # Note: slowapi does not support WebSocket rate limiting
 # WebSocket rate limiting would need to be implemented manually if required
@@ -124,7 +127,7 @@ async def voice_drill_session(
                 result = await voice_session_manager.end_session(drill_session_id)
                 await _persist_session_result(drill_session_id, session_data, result)
 
-                asyncio.create_task(
+                task = asyncio.create_task(
                     _maybe_trigger_feedback_pipeline(
                         drill_session_id,
                         session_data["drill_id"],
@@ -133,6 +136,8 @@ async def voice_drill_session(
                         result["duration_seconds"],
                     )
                 )
+                _background_tasks.add(task)
+                task.add_done_callback(_background_tasks.discard)
 
                 await _safe_send_json(
                     websocket,
@@ -443,7 +448,9 @@ async def _safe_send_json(websocket: WebSocket, payload: dict) -> None:
             e,
             payload.get("type"),
         )
-        raise  # Let caller handle
+        # We explicitly do not re-raise the exception because disconnection errors (e.g. 
+        # RuntimeError: Unexpected ASGI message 'websocket.send') will break closing procedures 
+        # and prevent background tasks from initiating successfully.
 
 
 async def _enforce_session_timeout(voice_session, max_minutes: int) -> None:

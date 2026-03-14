@@ -29,13 +29,10 @@ class Settings(BaseSettings):
     posthog_api_key: str | None = None
     posthog_host: str = "https://app.posthog.com"
 
-    # Google GenAI API Key (for LLM calls and ADK voice agent)
-    google_api_key: str = ""
-
     # Google Vertex AI Configuration
-    google_genai_use_vertexai: bool = False  # Set to True for Vertex AI
+    google_genai_use_vertexai: bool = True
     google_cloud_project: str = ""
-    google_cloud_location: str = "us-central1"
+    google_cloud_location: str = "global"  # For Gemini 3 LLM calls (requires global)
 
     # ADK Voice Agent Settings
     gemini_live_model: str = "gemini-live-2.5-flash-native-audio"
@@ -43,20 +40,20 @@ class Settings(BaseSettings):
     voice_session_max_duration_minutes: int = 25
     voice_session_hard_limit_minutes: int = 20
     voice_session_warning_minutes_before_hard_limit: int = 3
-    voice_session_max_concurrent: int = 1000  # 50 for AI Studio, 1000+ for Vertex AI
-    min_feedback_duration_seconds: int = 120  # 2 minutes - sessions shorter than this skip feedback
+    voice_session_max_concurrent: int = 100
+    min_feedback_duration_seconds: int = 60  # 2 minutes - sessions shorter than this skip feedback
 
     # ADK Voice Agent Feature Flags (all disabled by default)
-    voice_enable_session_resumption: bool = False
-    voice_enable_context_compression: bool = False
-    voice_enable_proactivity: bool = False
-    voice_enable_affective_dialog: bool = False
+    voice_enable_session_resumption: bool = True
+    voice_enable_context_compression: bool = True
+    voice_enable_proactivity: bool = True
+    voice_enable_affective_dialog: bool = True
 
     # Model Configuration
     llm_feedback_model: str = "gemini-3.1-pro-preview"
     llm_drill_selection_model: str = "gemini-3.1-pro-preview"
     llm_user_summary_model: str = "gemini-3.1-pro-preview"
-    llm_fallback_model: str = "gemini-3.1-flash-preview"
+    llm_fallback_model: str = "gemini-3-pro-preview"
 
 
 settings = Settings()

@@ -1,34 +1,46 @@
-# Live Agent - Backend
+# Primed — Backend
 
-FastAPI-based backend for the Primed app.
+Primed is an AI interview coach that conducts real-time voice interviews and gives actionable feedback
 
-The front-end app code can be found [here](https://github.com/Dhairya10/primed-app)
+Front-end: [primed-app](https://github.com/Dhairya10/primed-app)
+
+---
+
+## How It Works
+
+1. User picks a PM drill from a curated library
+2. A real-time bidirectional voice session starts, powered by ADK and Live API
+3. On session end, three ADK agents are invoked
+    - **FeedbackAgent** that evaluates the transcript against the skill rubric
+    - **UserSummaryAgent** that updates the candidate's living profile
+    - **RecommendationAgent** that selects the next drill
 
 ## Tech Stack
 
-- **FastAPI** - Web API framework
-- **Supabase** - PostgreSQL database and authentication
-- **Pydantic v2** - Data validation
-- **UV** - Package manager
-- **Pytest** - Testing framework
-- **Ruff** - Linting and formatting
-- **Opik** - Agent Tracking and Evaluation
+- **FastAPI** + **WebSockets** — API and real-time voice relay
+- **Google ADK** — agent runtime and session lifecycle
+- **Gemini Live API** (`gemini-live-2.5-flash-native-audio`) on **Vertex AI** — the voice interview agent
+- **Gemini 3.1 Pro** — feedback generation, drill selection, user profile updates
+- **PostgreSQL** — user data, skill scores, drill library, session history
+- **UV** — package manager
+- **Cloud Run** — backend deployment
 
-## Prerequisites
+### ADK Live Features
 
-- Python 3.12+
-- UV package manager ([installation guide](https://github.com/astral-sh/uv))
-- Supabase account and project
+- **Session Resumption** — transparent reconnection past the 10-min WebSocket limit
+- **Context Window Compression** — extends sessions beyond the 10-min hard cap (trigger: 100K tokens, target: 80K)
+- **Proactive Audio** — model stays silent unless there's something meaningful to say
+- **Affective Dialog** — model adapts tone to the user's emotional state
 
 ## Quick Start
 
-### 1. Install UV (if not already installed)
+### Prerequisites
 
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
+- Python 3.12+
+- [UV](https://github.com/astral-sh/uv) — `curl -LsSf https://astral.sh/uv/install.sh | sh`
+- Google Cloud project with Vertex AI enabled and Application Default Credentials configured
 
-### 2. Clone and Setup
+### Setup
 
 ```bash
 cd primed-api
@@ -36,62 +48,31 @@ uv venv
 uv sync
 ```
 
-### 3. Run the Application
+### Environment Variables
 
-**Option 1: Quick Start Script**
-```bash
-bash run.sh
+```env
+GOOGLE_CLOUD_PROJECT=your-gcp-project-id
+GOOGLE_CLOUD_LOCATION=us-central1
+GOOGLE_GENAI_USE_VERTEXAI=true
 ```
 
-**Option 2: Manual Start**
+### Run
+
 ```bash
 uv run uvicorn src.prep.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-The API will be available at `http://localhost:8000`
-
-### 4. Access API Documentation
-
-Once running, visit:
-- **Swagger UI**: `http://localhost:8000/docs`
-- **ReDoc**: `http://localhost:8000/redoc`
+API docs: `http://localhost:8000/docs`
 
 ## Testing
 
-### Run all tests
-```bash
-uv run pytest
-```
-
-### Run with coverage
 ```bash
 uv run pytest --cov=src --cov-report=term-missing -v
 ```
 
-### Run specific test file
-```bash
-uv run pytest src/prep/features/[feature_name]/tests/test_handlers.py -v
-```
-
 ## Code Quality
 
-### Format code
 ```bash
 uv run ruff format .
-```
-
-### Check linting
-```bash
-uv run ruff check .
-```
-
-### Auto-fix linting issues
-```bash
 uv run ruff check --fix .
 ```
-
-### Type checking
-```bash
-uv run mypy src/
-```
-
